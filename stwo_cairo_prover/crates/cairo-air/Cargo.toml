@@ -24,6 +24,7 @@ stwo-constraint-framework.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+bincode = { version = "2.0.1", features = ["serde"] }
 
 [dev-dependencies]
 rand.workspace = true
