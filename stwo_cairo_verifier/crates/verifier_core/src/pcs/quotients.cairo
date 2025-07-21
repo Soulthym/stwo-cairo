@@ -147,8 +147,8 @@ fn fri_answers_for_log_size(
     ref queried_values: TreeArray<Span<M31>>,
     n_columns: TreeArray<usize>,
 ) -> Span<QM31> {
-    let sample_batches = ColumnSampleBatchImpl::group_by_point(samples_per_column);
-    let quotient_constants = QuotientConstantsImpl::gen(@sample_batches, random_coeff);
+    let sample_batches_by_point = ColumnSampleBatchImpl::group_by_point(samples_per_column);
+    let quotient_constants = QuotientConstantsImpl::gen(@sample_batches_by_point, random_coeff);
     let commitment_domain = CanonicCosetImpl::new(log_size).circle_domain();
     let mut quotient_evals_at_queries = array![];
 
@@ -157,7 +157,7 @@ fn fri_answers_for_log_size(
         quotient_evals_at_queries
             .append(
                 accumulate_row_quotients(
-                    @sample_batches,
+                    @sample_batches_by_point,
                     queried_values_at_row.span(),
                     @quotient_constants,
                     commitment_domain.at(bit_reverse_index(*query_position, log_size)),
@@ -178,37 +178,30 @@ fn fri_answers_for_log_size(
 /// * `domain_point`: The domain point the query corresponts to.
 #[inline(always)]
 fn accumulate_row_quotients(
-    sample_batches: @Array<ColumnSampleBatch>,
+    sample_batches_by_point: @Array<ColumnSampleBatch>,
     queried_values_at_row: Span<M31>,
     quotient_constants: @QuotientConstants,
     domain_point: CirclePoint<M31>,
 ) -> QM31 {
-    let n_batches = sample_batches.len();
+    let n_batches = sample_batches_by_point.len();
     // TODO(andrew): Unnessesary asserts, remove.
-    assert!(n_batches == quotient_constants.line_coeffs.len());
-    assert!(n_batches == quotient_constants.batch_random_coeffs.len());
+    assert!(n_batches == quotient_constants.point_constants.len());
 
-    let denominator_inverses = quotient_denominator_inverses(sample_batches.span(), domain_point);
+    let denominator_inverses = quotient_denominator_inverses(
+        sample_batches_by_point.span(), domain_point,
+    );
     let domain_point_y: UnreducedM31 = domain_point.y.into();
 
     let mut quotient_accumulator: QM31 = Zero::zero();
 
-    let mut line_coeffs_list_iter = quotient_constants.line_coeffs.span().into_iter();
-    let mut batch_random_coeffs_iter = quotient_constants.batch_random_coeffs.span().into_iter();
     let mut denominator_inverses_iter = denominator_inverses.span().into_iter();
 
-    for sample_batch in sample_batches.span() {
+    for point_constants in quotient_constants.point_constants.span() {
         let mut numerator: PackedUnreducedQM31 = PackedUnreducedQM31Trait::large_zero();
 
-        let line_coeffs_list = line_coeffs_list_iter.next().unwrap();
-        let mut line_coeffs_iter = line_coeffs_list.span().into_iter();
-
-        for (column_index, _) in sample_batch.columns_and_values.span() {
+        for (column_index, line_coeffs) in point_constants.indexed_line_coeffs.span() {
             let query_eval_at_column = *queried_values_at_row.at(*column_index);
-
-            let ComplexConjugateLineCoeffs {
-                alpha_mul_a, alpha_mul_b, alpha_mul_c,
-            } = *line_coeffs_iter.next().unwrap();
+            let ComplexConjugateLineCoeffs { alpha_mul_a, alpha_mul_b, alpha_mul_c } = *line_coeffs;
 
             // The numerator is a line equation passing through
             //   (sample_point.y, sample_value), (conj(sample_point), conj(sample_value))
@@ -222,11 +215,12 @@ fn accumulate_row_quotients(
             numerator += alpha_mul_c.mul_m31(query_eval_at_column.into()) - linear_term;
         }
 
-        let batch_coeff = *batch_random_coeffs_iter.next().unwrap();
         let denom_inv = *denominator_inverses_iter.next().unwrap();
         let quotient = numerator.reduce().mul_cm31(denom_inv);
         quotient_accumulator =
-            QM31Trait::fused_mul_add(quotient_accumulator, batch_coeff, quotient);
+            QM31Trait::fused_mul_add(
+                quotient_accumulator, *point_constants.batch_random_coeffs, quotient,
+            );
     }
 
     quotient_accumulator
@@ -251,25 +245,35 @@ fn quotient_denominator_inverses(
     BatchInvertible::batch_inverse(denominators)
 }
 
-/// Holds the precomputed constant values used in each quotient evaluation.
+/// Holds the precomputed constant values used in each quotient evaluation, grouped evaluation
+/// point.
 #[derive(Debug, Drop)]
 pub struct QuotientConstants {
-    /// The line coefficients for each quotient numerator term.
-    pub line_coeffs: Array<Array<ComplexConjugateLineCoeffs>>,
+    /// The constants for each mask item.
+    pub point_constants: Array<PointQuotientConstants>,
+}
+
+/// Holds the precomputed constants for a given evaluation point.
+#[derive(Debug, Drop)]
+pub struct PointQuotientConstants {
+    /// Pair of (column index, line coefficients) for every sample.
+    pub indexed_line_coeffs: Array<(usize, ComplexConjugateLineCoeffs)>,
     /// The random coefficients used to linearly combine the batched quotients.
     ///
     /// For each sample batch we compute random_coeff^(number of columns in the batch),
     /// which is used to linearly combine multiple batches together.
-    pub batch_random_coeffs: Array<QM31>,
+    /// this is the coefficient for this batch of samples.
+    pub batch_random_coeffs: QM31,
 }
 
 #[generate_trait]
 impl QuotientConstantsImpl of QuotientConstantsTrait {
-    fn gen(sample_batches: @Array<ColumnSampleBatch>, random_coeff: QM31) -> QuotientConstants {
-        let mut line_coeffs = array![];
-        let mut batch_random_coeffs = array![];
+    fn gen(
+        sample_batches_by_point: @Array<ColumnSampleBatch>, random_coeff: QM31,
+    ) -> QuotientConstants {
+        let mut point_constants = array![];
 
-        for sample_batch in sample_batches.span() {
+        for sample_batch in sample_batches_by_point.span() {
             // TODO(ShaharS): Add salt. This assertion will fail at a probability of 1 to 2^62.
             // Use a better solution.
             assert!(
@@ -279,23 +283,26 @@ impl QuotientConstantsImpl of QuotientConstantsTrait {
             );
 
             let mut alpha: QM31 = One::one();
-            let mut batch_line_coeffs = array![];
+            let mut indexed_line_coeffs = array![];
 
-            for (_, column_value) in sample_batch.columns_and_values.span() {
+            for (column_idx, column_value) in sample_batch.columns_and_values.span() {
                 alpha = alpha * random_coeff;
-                batch_line_coeffs
+                indexed_line_coeffs
                     .append(
-                        ComplexConjugateLineCoeffsImpl::new(
-                            sample_batch.point, **column_value, alpha,
+                        (
+                            *column_idx,
+                            ComplexConjugateLineCoeffsImpl::new(
+                                sample_batch.point, **column_value, alpha,
+                            ),
                         ),
                     );
             }
 
-            batch_random_coeffs.append(alpha);
-            line_coeffs.append(batch_line_coeffs);
+            point_constants
+                .append(PointQuotientConstants { indexed_line_coeffs, batch_random_coeffs: alpha });
         }
 
-        QuotientConstants { line_coeffs, batch_random_coeffs }
+        QuotientConstants { point_constants }
     }
 }
 
@@ -335,6 +342,8 @@ impl ColumnSampleBatchImpl of ColumnSampleBatchTrait {
                 // Check if we've seen the point before.
                 if point_samples.is_null() {
                     point_set.append(*sample.point);
+                } else {
+                    println!("dup at column: {:?}", column);
                 }
 
                 let mut point_samples = point_samples.deref_or(array![]);
